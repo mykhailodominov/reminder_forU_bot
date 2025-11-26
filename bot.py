@@ -233,6 +233,10 @@ class EditEvent(StatesGroup):
     choose_field = State()
     new_value = State()
 
+class DeleteEvent(StatesGroup):
+    choose_id = State()
+
+
 
 # ======================== ХЕЛПЕРИ ПАРСИНГУ ============================
 
@@ -909,7 +913,8 @@ async def menu_delete_callback(callback: CallbackQuery, state: FSMContext):
         dt = datetime.fromisoformat(e["event_datetime"])
         text += f"ID {e['id']}: {e['title']} ({dt.strftime('%Y-%m-%d %H:%M')})\n"
 
-    await state.set_state("delete_id")
+    # ⬇️ Ось тут головна зміна
+    await state.set_state(DeleteEvent.choose_id)
     await callback.message.answer(text, reply_markup=ReplyKeyboardRemove())
 
 
@@ -1303,7 +1308,7 @@ def setup_handlers(dp: Dispatcher):
     dp.message.register(edit_event_new_value, EditEvent.new_value)
 
     # Видалення
-    dp.message.register(delete_event_process, F.state == "delete_id")
+    dp.message.register(delete_event_process, DeleteEvent.choose_id)
 
     # Усе інше
     dp.message.register(fallback)
