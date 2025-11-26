@@ -36,6 +36,9 @@ from db import (
     update_event_remind_before,
 )
 
+SUPPORT_LINK = "https://t.me/dominov_mykhailo"
+
+
 # ======================== КАТЕГОРІЇ ============================
 
 CATEGORY_LABELS = {
@@ -56,8 +59,10 @@ def main_menu_kb() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="🎂 Мої дні народження", callback_data="menu_birthdays")],
             [InlineKeyboardButton(text="✏️ Редагувати подію", callback_data="menu_edit")],
             [InlineKeyboardButton(text="🗑 Видалити подію", callback_data="menu_delete")],
+            [InlineKeyboardButton(text="🆘 Допомога", url=SUPPORT_LINK)],
         ]
     )
+
 
 
 def event_type_kb() -> InlineKeyboardMarkup:
@@ -207,6 +212,18 @@ async def cmd_export(message: Message, state: FSMContext):
         "У якому форматі надіслати експорт твоїх подій? 🙂",
         reply_markup=export_format_kb(),
     )
+
+async def cmd_help(message: Message, state: FSMContext):
+    text = (
+        "Якщо щось не працює, є питання або ідеї — "
+        f"напиши мені в особисті: <a href=\"{SUPPORT_LINK}\">написати сюди</a> 💬\n\n"
+        "Команди бота:\n"
+        "/start — головне меню\n"
+        "/birthdays — список днів народження\n"
+        "/export — експорт усіх подій\n"
+        "/help — ця підказка"
+    )
+    await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=main_menu_kb())
 
 
 # ======================== ДОДАВАННЯ ПОДІЇ ============================
@@ -914,8 +931,10 @@ async def fallback(message: Message):
 def setup_handlers(dp: Dispatcher):
     # Команди
     dp.message.register(cmd_start, CommandStart())
+    dp.message.register(cmd_help, Command("help"))
     dp.message.register(cmd_birthdays, Command("birthdays"))
     dp.message.register(cmd_export, Command("export"))
+
 
     # Меню
     dp.callback_query.register(menu_add_callback, F.data == "menu_add")
