@@ -41,7 +41,7 @@ from db import (
 # ======================== НАЛАШТУВАННЯ ============================
 
 # Сюди встав свій @username у Telegram
-SUPPORT_LINK = "https://t.me/mykhailodominov"
+SUPPORT_LINK = "https://t.me/dominov_mykhailo"
 
 
 CATEGORY_LABELS = {
