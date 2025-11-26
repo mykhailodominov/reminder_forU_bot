@@ -2,7 +2,10 @@ import asyncio
 import io
 import json
 import csv
+import os
 from datetime import datetime, date
+
+from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
@@ -903,6 +906,27 @@ async def reminder_loop(bot: Bot):
         await asyncio.sleep(60)
 
 
+# ======================== DUMMY HTTP SERVER ДЛЯ RENDER ============================
+
+async def handle(request):
+    return web.Response(text="OK")
+
+
+async def start_dummy_server():
+    """
+    Маленький HTTP-сервер, щоб Render бачив відкритий порт.
+    """
+    app = web.Application()
+    app.router.add_get("/", handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    port = int(os.environ.get("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"Dummy HTTP server started on port {port}")
+
+
 # ======================== Fallback ============================
 
 async def fallback(message: Message):
@@ -969,7 +993,10 @@ async def main():
 
     setup_handlers(dp)
 
+    # Нагадувач
     asyncio.create_task(reminder_loop(bot))
+    # Фейковий HTTP-сервер для Render
+    asyncio.create_task(start_dummy_server())
 
     print("Bot started.")
     await dp.start_polling(bot)
