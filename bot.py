@@ -4,6 +4,7 @@ import json
 import csv
 import re
 from datetime import datetime, date, time, timedelta
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
@@ -15,6 +16,7 @@ from aiogram.types import (
     CallbackQuery,
     BufferedInputFile,
 )
+    # якщо раптом немає ParseMode/StatesGroup/FSMContext — перевір, що aiogram 3.x
 from aiogram.enums import ParseMode
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
@@ -36,12 +38,39 @@ from db import (
     update_event_datetime_and_reset,
     update_event_remind_before,
     delete_event_by_id,
+    get_user_timezone,
+    set_user_timezone,
 )
 
-# ======================== НАЛАШТУВАННЯ ============================
+# ======================== TZ + НАЛАШТУВАННЯ ============================
 
-# Сюди встав свій @username у Telegram
-SUPPORT_LINK = "https://t.me/dominov_mykhailo"
+DEFAULT_TZ = "Europe/Tallinn"
+UTC = ZoneInfo("UTC")
+
+SUPPORT_LINK = "https://t.me/mykhailodominov"   # заміни на свій @username
+
+
+def get_tzinfo_for_user(user_id: int) -> ZoneInfo:
+    tz_str = get_user_timezone(user_id) or DEFAULT_TZ
+    try:
+        return ZoneInfo(tz_str)
+    except Exception:
+        return ZoneInfo(DEFAULT_TZ)
+
+
+def local_to_utc(dt_local: datetime, tz: ZoneInfo) -> datetime:
+    """
+    Отримує локальний datetime (naive) + tz → повертає UTC (naive),
+    який ми і зберігаємо в БД.
+    """
+    return dt_local.replace(tzinfo=tz).astimezone(UTC).replace(tzinfo=None)
+
+
+def utc_to_local(dt_utc: datetime, tz: ZoneInfo) -> datetime:
+    """
+    Отримує UTC (naive) → повертає локальний datetime (naive) у заданій TZ.
+    """
+    return dt_utc.replace(tzinfo=UTC).astimezone(tz).replace(tzinfo=None)
 
 
 CATEGORY_LABELS = {
@@ -62,6 +91,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="🎂 Мої дні народження", callback_data="menu_birthdays")],
             [InlineKeyboardButton(text="✏️ Редагувати подію", callback_data="menu_edit")],
             [InlineKeyboardButton(text="🗑 Видалити подію", callback_data="menu_delete")],
+            [InlineKeyboardButton(text="🌍 Часовий пояс", callback_data="menu_tz")],
             [InlineKeyboardButton(text="🆘 Допомога", url=SUPPORT_LINK)],
         ]
     )
@@ -145,12 +175,13 @@ def export_format_kb() -> InlineKeyboardMarkup:
     )
 
 
-def build_preset_datetime_kb() -> InlineKeyboardMarkup:
+def build_preset_datetime_kb(user_tz: ZoneInfo) -> InlineKeyboardMarkup:
     """
-    Міні-календар на 7 днів з готовими слотами часу (09:00, 18:00).
+    Міні-календар на 7 днів з готовими слотами 09:00 / 18:00,
+    але в callback_data вже лежить час у UTC.
     """
-    now = datetime.now()
-    today = now.date()
+    now_local = datetime.now(user_tz)
+    today = now_local.date()
 
     buttons = []
     for i in range(7):
@@ -163,7 +194,11 @@ def build_preset_datetime_kb() -> InlineKeyboardMarkup:
             day_label = d.strftime("%d.%m")
 
         for t_str in ("09:00", "18:00"):
-            dt_str = f"{d.isoformat()}T{t_str}"
+            hh, mm = map(int, t_str.split(":"))
+            dt_local = datetime(d.year, d.month, d.day, hh, mm)
+            dt_utc = local_to_utc(dt_local, user_tz)
+            dt_str = dt_utc.isoformat()
+
             text = f"{day_label} {t_str}"
             buttons.append(
                 InlineKeyboardButton(
@@ -217,13 +252,34 @@ def confirm_time_kb() -> InlineKeyboardMarkup:
     )
 
 
+def timezone_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🇪🇪 Europe/Tallinn", callback_data="tz:Europe/Tallinn"),
+                InlineKeyboardButton(text="🇺🇦 Europe/Kyiv", callback_data="tz:Europe/Kyiv"),
+            ],
+            [
+                InlineKeyboardButton(text="🇵🇱 Europe/Warsaw", callback_data="tz:Europe/Warsaw"),
+                InlineKeyboardButton(text="🇩🇪 Europe/Berlin", callback_data="tz:Europe/Berlin"),
+            ],
+            [
+                InlineKeyboardButton(text="🇬🇧 Europe/London", callback_data="tz:Europe/London"),
+            ],
+            [
+                InlineKeyboardButton(text="⌨️ Інший (ввести вручну)", callback_data="tz:manual"),
+            ],
+        ]
+    )
+
+
 # ======================== FSM ============================
 
 class AddEvent(StatesGroup):
     type = State()
     title = State()
     category = State()
-    datetime = State()        # Для вводу дати/часу (і ДР, і звичайних подій)
+    datetime = State()
     birthday_time = State()
     remind = State()
 
@@ -233,22 +289,18 @@ class EditEvent(StatesGroup):
     choose_field = State()
     new_value = State()
 
+
 class DeleteEvent(StatesGroup):
     choose_id = State()
 
+
+class SetTimezone(StatesGroup):
+    waiting = State()
 
 
 # ======================== ХЕЛПЕРИ ПАРСИНГУ ============================
 
 def parse_datetime_full(text: str):
-    """
-    Підтримує:
-    - 2025-11-22 18:00
-    - 22-11-2025 18:00
-    - 22.11.2025 18:00
-    - 22/11/2025 18:00
-    Зайві пробіли і різні розділювачі не страшні.
-    """
     raw = text.strip()
     raw = raw.replace("/", "-").replace(".", "-")
     raw = re.sub(r"\s+", " ", raw)
@@ -262,13 +314,6 @@ def parse_datetime_full(text: str):
 
 
 def parse_birthdate(text: str):
-    """
-    Підтримує:
-    - 1999-05-10
-    - 10-05-1999
-    - 10.05.1999
-    - 10/05/1999
-    """
     raw = text.strip()
     raw = raw.replace("/", "-").replace(".", "-")
     for fmt in ("%Y-%m-%d", "%d-%m-%Y"):
@@ -280,18 +325,9 @@ def parse_birthdate(text: str):
 
 
 def parse_time_str(text: str):
-    """
-    Підтримує:
-    - 09:00
-    - 9:00
-    - 0900
-    - 09.00
-    - 09,00
-    """
     raw = text.strip()
     raw = raw.replace(".", ":").replace(",", ":")
 
-    # "0900" -> "09:00"
     if ":" not in raw and raw.isdigit() and len(raw) == 4:
         raw = raw[:2] + ":" + raw[2:]
 
@@ -301,17 +337,24 @@ def parse_time_str(text: str):
         return None
 
 
-# ======================== /start, /help, /birthdays, /export ============================
+# ======================== /start, /help, /timezone, /birthdays, /export ============================
 
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
-    get_or_create_user(message.from_user.id, message.from_user.username)
+    user_id = get_or_create_user(message.from_user.id, message.from_user.username)
+    tz_str = get_user_timezone(user_id) or DEFAULT_TZ
+
+    text = (
+        "Привіт 👋\n\n"
+        "Я бот-нагадувач. Допоможу не забути важливі події.\n\n"
+        f"Зараз твій часовий пояс: <b>{tz_str}</b>\n"
+        "За потреби можеш змінити його через кнопку «🌍 Часовий пояс» або команду /timezone.\n\n"
+        "Обери дію нижче:"
+    )
 
     await message.answer(
-        "Привіт 👋\n\n"
-        "Я бот-нагадувач.\n"
-        "Допоможу не забути важливі події.\n\n"
-        "Обери дію нижче:",
+        text,
+        parse_mode=ParseMode.HTML,
         reply_markup=main_menu_kb(),
     )
 
@@ -324,6 +367,7 @@ async def cmd_help(message: Message, state: FSMContext):
         "/start — головне меню\n"
         "/birthdays — список днів народження\n"
         "/export — експорт усіх подій\n"
+        "/timezone — налаштування часового поясу\n"
         "/help — ця підказка"
     )
     await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=main_menu_kb())
@@ -340,6 +384,88 @@ async def cmd_export(message: Message, state: FSMContext):
     await message.answer(
         "У якому форматі надіслати експорт твоїх подій? 🙂",
         reply_markup=export_format_kb(),
+    )
+
+
+async def cmd_timezone(message: Message, state: FSMContext):
+    user_id = get_or_create_user(message.from_user.id, message.from_user.username)
+    tz_str = get_user_timezone(user_id) or DEFAULT_TZ
+    await message.answer(
+        "Обери свій часовий пояс нижче або введи вручну.\n"
+        f"Зараз встановлено: <b>{tz_str}</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=timezone_kb(),
+    )
+
+
+async def menu_tz_callback(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    user_id = get_or_create_user(callback.from_user.id, callback.from_user.username)
+    tz_str = get_user_timezone(user_id) or DEFAULT_TZ
+    await callback.message.answer(
+        "Обери свій часовий пояс нижче або введи вручну.\n"
+        f"Зараз встановлено: <b>{tz_str}</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=timezone_kb(),
+    )
+
+
+async def tz_select_callback(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    user_id = get_or_create_user(callback.from_user.id, callback.from_user.username)
+
+    if callback.data == "tz:manual":
+        await state.set_state(SetTimezone.waiting)
+        await callback.message.answer(
+            "Введи назву свого часового поясу, наприклад:\n"
+            "<code>Europe/Tallinn</code>, <code>Europe/Kyiv</code>, <code>Europe/Warsaw</code>.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    _, tz_str = callback.data.split(":", 1)
+    try:
+        tzinfo = ZoneInfo(tz_str)
+    except Exception:
+        await callback.message.answer(
+            "Не вийшло розпізнати цей часовий пояс. "
+            "Спробуй ще раз або обери інший.",
+        )
+        return
+
+    set_user_timezone(user_id, tz_str)
+    now_local = datetime.now(tzinfo)
+
+    await callback.message.answer(
+        f"✅ Часовий пояс оновлено: <b>{tz_str}</b>\n"
+        f"Зараз у тебе: <b>{now_local.strftime('%Y-%m-%d %H:%M')}</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_menu_kb(),
+    )
+
+
+async def tz_manual_set(message: Message, state: FSMContext):
+    tz_str = message.text.strip()
+    try:
+        tzinfo = ZoneInfo(tz_str)
+    except Exception:
+        await message.answer(
+            "Не вдалося розпізнати цей час. пояс.\n"
+            "Приклад: <code>Europe/Tallinn</code>, <code>Europe/Kyiv</code>.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    user_id = get_or_create_user(message.from_user.id, message.from_user.username)
+    set_user_timezone(user_id, tz_str)
+    await state.clear()
+
+    now_local = datetime.now(tzinfo)
+    await message.answer(
+        f"✅ Часовий пояс оновлено: <b>{tz_str}</b>\n"
+        f"Зараз у тебе: <b>{now_local.strftime('%Y-%m-%d %H:%M')}</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_menu_kb(),
     )
 
 
@@ -393,17 +519,19 @@ async def add_event_title(message: Message, state: FSMContext):
 
 async def add_event_category_callback(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
-    cb = callback.data  # cat_family / cat_friends / cat_work / cat_other
+    cb = callback.data
 
     if not cb.startswith("cat_"):
         return
 
-    category_key = cb.split("_", 1)[1]  # family / friends / work / other
+    category_key = cb.split("_", 1)[1]
     await state.update_data(category=category_key)
     data = await state.get_data()
     event_type = data["type"]
 
-    # Для ДР — просимо дату народження
+    user_id = get_or_create_user(callback.from_user.id, callback.from_user.username)
+    user_tzinfo = get_tzinfo_for_user(user_id)
+
     if event_type == "birthday":
         await state.set_state(AddEvent.datetime)
         await callback.message.answer(
@@ -413,7 +541,6 @@ async def add_event_category_callback(callback: CallbackQuery, state: FSMContext
             parse_mode=ParseMode.HTML,
         )
     else:
-        # Для звичайних подій — міні-календар + можливість ручного вводу
         await state.set_state(AddEvent.datetime)
         await callback.message.answer(
             "Оберіть дату і час події з варіантів нижче або введи вручну.\n\n"
@@ -421,17 +548,19 @@ async def add_event_category_callback(callback: CallbackQuery, state: FSMContext
             "<code>2025-11-22 18:00</code>\n"
             "або <code>22.11.2025 18:00</code> чи <code>22-11-2025 18:00</code>.",
             parse_mode=ParseMode.HTML,
-            reply_markup=build_preset_datetime_kb(),
+            reply_markup=build_preset_datetime_kb(user_tzinfo),
         )
 
 
-# ---------- Ручний ввід дати/часу (і для ДР, і для звичайних) ----------
+# ---------- Ручний ввід дати/часу ----------
 
 async def add_event_datetime(message: Message, state: FSMContext):
     data = await state.get_data()
     event_type = data["type"]
+    user_id = get_or_create_user(message.from_user.id, message.from_user.username)
+    user_tzinfo = get_tzinfo_for_user(user_id)
 
-    # День народження
+    # ДР
     if event_type == "birthday":
         bdate = parse_birthdate(message.text)
         if not bdate:
@@ -442,7 +571,6 @@ async def add_event_datetime(message: Message, state: FSMContext):
             )
             return
 
-        # soft-валидація
         await state.update_data(pending_birthdate=bdate.isoformat())
         await message.answer(
             f"Ти маєш на увазі: <b>{bdate.strftime('%d.%m.%Y')}</b>?",
@@ -451,9 +579,9 @@ async def add_event_datetime(message: Message, state: FSMContext):
         )
         return
 
-    # Звичайні події: повний datetime
-    dt = parse_datetime_full(message.text)
-    if not dt:
+    # Звичайні події: локальний datetime → UTC
+    dt_local = parse_datetime_full(message.text)
+    if not dt_local:
         await message.answer(
             "Не можу розібрати дату і час 😕\n"
             "Спробуй у форматі <code>2025-11-22 18:00</code>\n"
@@ -462,11 +590,14 @@ async def add_event_datetime(message: Message, state: FSMContext):
         )
         return
 
-    if dt < datetime.now():
+    dt_utc = local_to_utc(dt_local, user_tzinfo)
+    now_utc = datetime.now(UTC).replace(tzinfo=None)
+
+    if dt_utc < now_utc:
         await message.answer("Дата в минулому ⏳ Обери майбутню.")
         return
 
-    await state.update_data(datetime=dt)
+    await state.update_data(datetime=dt_utc)
     await state.set_state(AddEvent.remind)
     await message.answer(
         "За скільки хвилин нагадати?\n"
@@ -552,16 +683,18 @@ async def bday_time_confirm_callback(callback: CallbackQuery, state: FSMContext)
         return
 
     t = datetime.strptime(pending_time, "%H:%M").time()
+    user_id = get_or_create_user(callback.from_user.id, callback.from_user.username)
+    user_tzinfo = get_tzinfo_for_user(user_id)
 
-    today = date.today()
-    year = today.year
+    today_local = datetime.now(user_tzinfo).date()
+    year = today_local.year
     next_date = date(year, bdate.month, bdate.day)
-    if next_date < today:
+    if next_date < today_local:
         next_date = date(year + 1, bdate.month, bdate.day)
 
-    final_dt = datetime.combine(next_date, t)
+    final_dt_local = datetime.combine(next_date, t)
+    final_dt_utc = local_to_utc(final_dt_local, user_tzinfo)
 
-    user_id = get_or_create_user(callback.from_user.id, callback.from_user.username)
     data = await state.get_data()
 
     add_event(
@@ -569,17 +702,18 @@ async def bday_time_confirm_callback(callback: CallbackQuery, state: FSMContext)
         title=data["title"],
         type_="birthday",
         category=data["category"],
-        event_dt=final_dt,
+        event_dt_utc=final_dt_utc,
         remind_before_minutes=0,
         repeat_yearly=True,
     )
 
     await state.clear()
+    dt_local_show = final_dt_local
     await callback.message.answer(
         "🎉 День народження додано!\n\n"
         f"<b>{data['title']}</b>\n"
         f"Категорія: {CATEGORY_LABELS.get(data['category'], '📌 Інше')}\n"
-        f"Наступна дата: {final_dt.strftime('%Y-%m-%d')} о {final_dt.strftime('%H:%M')}",
+        f"Наступна дата: {dt_local_show.strftime('%Y-%m-%d')} о {dt_local_show.strftime('%H:%M')}",
         parse_mode=ParseMode.HTML,
         reply_markup=main_menu_kb(),
     )
@@ -591,6 +725,9 @@ async def preset_datetime_callback(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     data = await state.get_data()
     event_type = data.get("type")
+
+    user_id = get_or_create_user(callback.from_user.id, callback.from_user.username)
+    user_tzinfo = get_tzinfo_for_user(user_id)
 
     if event_type == "birthday":
         await callback.message.answer(
@@ -609,31 +746,34 @@ async def preset_datetime_callback(callback: CallbackQuery, state: FSMContext):
 
     _, dt_str = callback.data.split(":", 1)
     try:
-        dt = datetime.fromisoformat(dt_str)
+        dt_utc = datetime.fromisoformat(dt_str)
     except ValueError:
         await callback.message.answer(
             "Не вдалося розпізнати дату, введи її, будь ласка, вручну.",
         )
         return
 
-    if dt < datetime.now():
+    now_utc = datetime.now(UTC).replace(tzinfo=None)
+    if dt_utc < now_utc:
         await callback.message.answer("Ця дата вже в минулому. Обери щось у майбутньому.")
         return
 
-    await state.update_data(datetime=dt)
+    await state.update_data(datetime=dt_utc)
     await state.set_state(AddEvent.remind)
+    dt_local = utc_to_local(dt_utc, user_tzinfo)
     await callback.message.answer(
         "За скільки хвилин нагадати?\n"
         "0 — тільки в момент події\n"
         "60 — за годину до\n"
         "1440 — за день до\n\n"
+        f"Обрана дата: <b>{dt_local.strftime('%Y-%m-%d %H:%M')}</b>\n"
         "Можеш обрати готовий варіант нижче або ввести свою кількість хвилин.",
         parse_mode=ParseMode.HTML,
         reply_markup=remind_choice_kb(),
     )
 
 
-# ---------- Ввід remind (хвилини) ----------
+# ---------- Ввід remind ----------
 
 async def add_event_remind(message: Message, state: FSMContext):
     raw = message.text.strip()
@@ -648,16 +788,17 @@ async def add_event_remind(message: Message, state: FSMContext):
 
     data = await state.get_data()
     user_id = get_or_create_user(message.from_user.id, message.from_user.username)
-    dt = data.get("datetime")
-    if isinstance(dt, str):
-        dt = datetime.fromisoformat(dt)
+    dt_utc = data.get("datetime")
+
+    if isinstance(dt_utc, str):
+        dt_utc = datetime.fromisoformat(dt_utc)
 
     add_event(
         user_id=user_id,
         title=data["title"],
         type_=data["type"],
         category=data["category"],
-        event_dt=dt,
+        event_dt_utc=dt_utc,
         remind_before_minutes=minutes,
         repeat_yearly=False,
     )
@@ -682,11 +823,11 @@ async def remind_preset_callback(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     user_id = get_or_create_user(callback.from_user.id, callback.from_user.username)
 
-    dt = data.get("datetime")
-    if isinstance(dt, str):
-        dt = datetime.fromisoformat(dt)
+    dt_utc = data.get("datetime")
+    if isinstance(dt_utc, str):
+        dt_utc = datetime.fromisoformat(dt_utc)
 
-    if dt is None:
+    if dt_utc is None:
         await callback.message.answer(
             "Не бачу дати події, спробуй додати подію ще раз 🙈"
         )
@@ -698,7 +839,7 @@ async def remind_preset_callback(callback: CallbackQuery, state: FSMContext):
         title=data["title"],
         type_=data["type"],
         category=data["category"],
-        event_dt=dt,
+        event_dt_utc=dt_utc,
         remind_before_minutes=minutes,
         repeat_yearly=False,
     )
@@ -710,21 +851,25 @@ async def remind_preset_callback(callback: CallbackQuery, state: FSMContext):
     )
 
 
-# ======================== СПИСКИ ПОДІЙ (З ФІЛЬТРАМИ) ============================
+# ======================== СПИСКИ ПОДІЙ ============================
 
 async def render_events(message: Message, events, header: str):
+    user_id = get_or_create_user(message.from_user.id, message.from_user.username)
+    tzinfo = get_tzinfo_for_user(user_id)
+
     if not events:
         await message.answer("Немає подій за цим фільтром.", reply_markup=main_menu_kb())
         return
 
     text = f"{header}\n\n"
     for idx, e in enumerate(events, start=1):
-        dt = datetime.fromisoformat(e["event_datetime"])
+        dt_utc = datetime.fromisoformat(e["event_datetime"])
+        dt_local = utc_to_local(dt_utc, tzinfo)
         cat = e["category"] if e["category"] else "other"
         text += (
             f"{idx}) <b>{e['title']}</b>\n"
             f"ID: <code>{e['id']}</code>\n"
-            f"{dt.strftime('%Y-%m-%d %H:%M')}\n"
+            f"{dt_local.strftime('%Y-%m-%d %H:%M')}\n"
             f"Тип: {e['type']}\n"
             f"Категорія: {CATEGORY_LABELS.get(cat, '📌 Інше')}\n\n"
         )
@@ -735,18 +880,22 @@ async def render_events(message: Message, events, header: str):
 
 
 async def render_birthdays(message: Message, events, header: str):
+    user_id = get_or_create_user(message.from_user.id, message.from_user.username)
+    tzinfo = get_tzinfo_for_user(user_id)
+
     if not events:
         await message.answer("Немає днів народження за цим фільтром 🎂", reply_markup=main_menu_kb())
         return
 
     text = f"{header}\n\n"
     for idx, e in enumerate(events, start=1):
-        dt = datetime.fromisoformat(e["event_datetime"])
+        dt_utc = datetime.fromisoformat(e["event_datetime"])
+        dt_local = utc_to_local(dt_utc, tzinfo)
         cat = e["category"] if e["category"] else "other"
         text += (
             f"{idx}) <b>{e['title']}</b>\n"
             f"ID: <code>{e['id']}</code>\n"
-            f"Наступна дата: {dt.strftime('%Y-%m-%d')} о {dt.strftime('%H:%M')}\n"
+            f"Наступна дата: {dt_local.strftime('%Y-%m-%d')} о {dt_local.strftime('%H:%M')}\n"
             f"Категорія: {CATEGORY_LABELS.get(cat, '📌 Інше')}\n\n"
         )
 
@@ -767,8 +916,8 @@ async def list_filter_callback(callback: CallbackQuery):
     await callback.answer()
     user_id = get_or_create_user(callback.from_user.id, callback.from_user.username)
 
-    cb = callback.data  # list_cat_all / list_cat_family ...
-    key = cb.split("_", 2)[2]  # all / family / friends / work / other
+    cb = callback.data
+    key = cb.split("_", 2)[2]
 
     if key == "all":
         events = get_user_events(user_id)
@@ -792,8 +941,8 @@ async def birthdays_filter_callback(callback: CallbackQuery):
     await callback.answer()
     user_id = get_or_create_user(callback.from_user.id, callback.from_user.username)
 
-    cb = callback.data  # bday_cat_all / bday_cat_family ...
-    key = cb.split("_", 2)[2]  # all / family / friends / work / other
+    cb = callback.data
+    key = cb.split("_", 2)[2]
 
     if key == "all":
         events = get_user_birthdays(user_id)
@@ -828,7 +977,7 @@ async def export_csv_callback(callback: CallbackQuery):
         "title",
         "type",
         "category",
-        "event_datetime",
+        "event_datetime_utc",
         "remind_before_minutes",
         "repeat_yearly",
     ])
@@ -878,7 +1027,7 @@ async def export_json_callback(callback: CallbackQuery):
             "title": e["title"],
             "type": e["type"],
             "category": e["category"],
-            "event_datetime": e["event_datetime"],
+            "event_datetime_utc": e["event_datetime"],
             "remind_before_minutes": e["remind_before_minutes"],
             "repeat_yearly": bool(e["repeat_yearly"]),
         })
@@ -902,6 +1051,7 @@ async def export_json_callback(callback: CallbackQuery):
 async def menu_delete_callback(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     user_id = get_or_create_user(callback.from_user.id, callback.from_user.username)
+    tzinfo = get_tzinfo_for_user(user_id)
     events = get_user_events(user_id)
 
     if not events:
@@ -910,10 +1060,10 @@ async def menu_delete_callback(callback: CallbackQuery, state: FSMContext):
 
     text = "Введи ID події для видалення:\n\n"
     for e in events:
-        dt = datetime.fromisoformat(e["event_datetime"])
-        text += f"ID {e['id']}: {e['title']} ({dt.strftime('%Y-%m-%d %H:%M')})\n"
+        dt_utc = datetime.fromisoformat(e["event_datetime"])
+        dt_local = utc_to_local(dt_utc, tzinfo)
+        text += f"ID {e['id']}: {e['title']} ({dt_local.strftime('%Y-%m-%d %H:%M')})\n"
 
-    # ⬇️ Ось тут головна зміна
     await state.set_state(DeleteEvent.choose_id)
     await callback.message.answer(text, reply_markup=ReplyKeyboardRemove())
 
@@ -941,6 +1091,7 @@ async def delete_event_process(message: Message, state: FSMContext):
 async def menu_edit_callback(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     user_id = get_or_create_user(callback.from_user.id, callback.from_user.username)
+    tzinfo = get_tzinfo_for_user(user_id)
     events = get_user_events(user_id)
 
     if not events:
@@ -949,11 +1100,12 @@ async def menu_edit_callback(callback: CallbackQuery, state: FSMContext):
 
     text = "Введи ID події, яку хочеш змінити:\n\n"
     for e in events:
-        dt = datetime.fromisoformat(e["event_datetime"])
+        dt_utc = datetime.fromisoformat(e["event_datetime"])
+        dt_local = utc_to_local(dt_utc, tzinfo)
         cat = e["category"] if e["category"] else "other"
         text += (
             f"ID {e['id']}: {e['title']} "
-            f"({dt.strftime('%Y-%m-%d %H:%M')}, тип: {e['type']}, "
+            f"({dt_local.strftime('%Y-%m-%d %H:%M')}, тип: {e['type']}, "
             f"категорія: {CATEGORY_LABELS.get(cat, '📌 Інше')})\n"
         )
 
@@ -979,11 +1131,14 @@ async def edit_event_choose_id(message: Message, state: FSMContext):
     await state.update_data(edit_event_id=event_id, edit_event_type=event_type)
     await state.set_state(EditEvent.choose_field)
 
-    dt = datetime.fromisoformat(row["event_datetime"])
+    tzinfo = get_tzinfo_for_user(user_id)
+    dt_utc = datetime.fromisoformat(row["event_datetime"])
+    dt_local = utc_to_local(dt_utc, tzinfo)
+
     await message.answer(
         "Що хочеш змінити?\n\n"
         f"<b>{row['title']}</b>\n"
-        f"{dt.strftime('%Y-%m-%d %H:%M')}\n"
+        f"{dt_local.strftime('%Y-%m-%d %H:%M')}\n"
         f"Тип: {event_type}",
         parse_mode=ParseMode.HTML,
         reply_markup=edit_fields_kb(event_type),
@@ -1060,9 +1215,9 @@ async def edit_event_new_value(message: Message, state: FSMContext):
         )
         return
 
-    now = datetime.now()
+    user_tzinfo = get_tzinfo_for_user(user_id)
+    now_utc = datetime.now(UTC).replace(tzinfo=None)
 
-    # Назва
     if field == "title":
         new_title = message.text.strip()
         if len(new_title) < 2:
@@ -1073,9 +1228,9 @@ async def edit_event_new_value(message: Message, state: FSMContext):
         await message.answer("Назву оновлено ✅", reply_markup=main_menu_kb())
         return
 
-    # Дні народження
     if event_type == "birthday":
-        existing_dt = datetime.fromisoformat(row["event_datetime"])
+        existing_dt_utc = datetime.fromisoformat(row["event_datetime"])
+        existing_dt_local = utc_to_local(existing_dt_utc, user_tzinfo)
 
         if field == "birthdate":
             bdate = parse_birthdate(message.text)
@@ -1086,14 +1241,16 @@ async def edit_event_new_value(message: Message, state: FSMContext):
                 )
                 return
 
-            today = date.today()
-            year = today.year
+            today_local = datetime.now(user_tzinfo).date()
+            year = today_local.year
             next_bday = date(year, bdate.month, bdate.day)
-            if next_bday < today:
+            if next_bday < today_local:
                 next_bday = date(year + 1, bdate.month, bdate.day)
 
-            new_dt = datetime.combine(next_bday, existing_dt.time())
-            update_event_datetime_and_reset(event_id, new_dt, is_birthday=True)
+            new_local = datetime.combine(next_bday, existing_dt_local.time())
+            new_utc = local_to_utc(new_local, user_tzinfo)
+
+            update_event_datetime_and_reset(event_id, new_utc, is_birthday=True)
 
             await state.clear()
             await message.answer("Дату народження оновлено ✅", reply_markup=main_menu_kb())
@@ -1108,32 +1265,36 @@ async def edit_event_new_value(message: Message, state: FSMContext):
                 )
                 return
 
-            new_dt = datetime.combine(existing_dt.date(), t)
-            if new_dt < now:
-                new_dt = new_dt.replace(year=new_dt.year + 1)
+            new_local = datetime.combine(existing_dt_local.date(), t)
+            new_utc = local_to_utc(new_local, user_tzinfo)
 
-            update_event_datetime_and_reset(event_id, new_dt, is_birthday=True)
+            if new_utc < now_utc:
+                new_local = new_local.replace(year=new_local.year + 1)
+                new_utc = local_to_utc(new_local, user_tzinfo)
+
+            update_event_datetime_and_reset(event_id, new_utc, is_birthday=True)
 
             await state.clear()
             await message.answer("Час нагадувань оновлено ✅", reply_markup=main_menu_kb())
             return
 
-    # Інші події
     else:
         if field == "datetime":
-            dt = parse_datetime_full(message.text)
-            if not dt:
+            dt_local = parse_datetime_full(message.text)
+            if not dt_local:
                 await message.answer(
                     "Невірний формат. Спробуй так:\n"
                     "<code>2025-12-31 18:00</code> або <code>31.12.2025 18:00</code>.",
                     parse_mode=ParseMode.HTML,
                 )
                 return
-            if dt < now:
+
+            dt_utc = local_to_utc(dt_local, user_tzinfo)
+            if dt_utc < now_utc:
                 await message.answer("Ця дата вже в минулому. Вкажи майбутню.")
                 return
 
-            update_event_datetime_and_reset(event_id, dt, is_birthday=False)
+            update_event_datetime_and_reset(event_id, dt_utc, is_birthday=False)
             await state.clear()
             await message.answer(
                 "Дату й час події оновлено ✅",
@@ -1167,8 +1328,8 @@ async def edit_event_new_value(message: Message, state: FSMContext):
 
 async def reminder_loop(bot: Bot):
     while True:
-        now = datetime.now()
-        events = get_events_to_notify(now)
+        now_utc = datetime.now(UTC).replace(tzinfo=None)
+        events = get_events_to_notify(now_utc)
 
         for item in events:
             row = item["row"]
@@ -1176,11 +1337,17 @@ async def reminder_loop(bot: Bot):
 
             tg_id = row["tg_id"]
             title = row["title"]
-            event_dt = datetime.fromisoformat(row["event_datetime"])
+            event_dt_utc = datetime.fromisoformat(row["event_datetime"])
             repeat_yearly = bool(row["repeat_yearly"])
             event_type = row["type"]
+            tz_str = row["timezone"] or DEFAULT_TZ
+            try:
+                user_tzinfo = ZoneInfo(tz_str)
+            except Exception:
+                user_tzinfo = ZoneInfo(DEFAULT_TZ)
 
-            # Дні народження
+            event_dt_local = utc_to_local(event_dt_utc, user_tzinfo)
+
             if event_type == "birthday":
                 if kind == "30d":
                     text = f"🥳 За місяць день народження: <b>{title}</b>"
@@ -1198,12 +1365,11 @@ async def reminder_loop(bot: Bot):
 
                 mark_notified(row["id"], kind, repeat_yearly)
 
-            # Звичайні події
             else:
                 if kind == "before":
                     text = (
                         f"⏰ Нагадування: <b>{title}</b>\n"
-                        f"О {event_dt.strftime('%Y-%m-%d %H:%M')}"
+                        f"О {event_dt_local.strftime('%Y-%m-%d %H:%M')}"
                     )
                     try:
                         await bot.send_message(tg_id, text, parse_mode=ParseMode.HTML)
@@ -1215,14 +1381,13 @@ async def reminder_loop(bot: Bot):
                 elif kind == "main":
                     text = (
                         f"🔥 Подія зараз: <b>{title}</b>\n"
-                        f"{event_dt.strftime('%Y-%m-%d %H:%M')}"
+                        f"{event_dt_local.strftime('%Y-%m-%d %H:%M')}"
                     )
                     try:
                         await bot.send_message(tg_id, text, parse_mode=ParseMode.HTML)
                     except Exception as e:
                         print(f"Помилка надсилання (main): {e}")
 
-                    # Автовидалення звичайних подій після основного нагадування
                     try:
                         delete_event_by_id(row["id"])
                         print(f"Подію id={row['id']} видалено автоматично після проходження.")
@@ -1246,6 +1411,7 @@ def setup_handlers(dp: Dispatcher):
     dp.message.register(cmd_help, Command("help"))
     dp.message.register(cmd_birthdays, Command("birthdays"))
     dp.message.register(cmd_export, Command("export"))
+    dp.message.register(cmd_timezone, Command("timezone"))
 
     # Меню
     dp.callback_query.register(menu_add_callback, F.data == "menu_add")
@@ -1253,10 +1419,11 @@ def setup_handlers(dp: Dispatcher):
     dp.callback_query.register(menu_birthdays_callback, F.data == "menu_birthdays")
     dp.callback_query.register(menu_edit_callback, F.data == "menu_edit")
     dp.callback_query.register(menu_delete_callback, F.data == "menu_delete")
+    dp.callback_query.register(menu_tz_callback, F.data == "menu_tz")
 
-    # Експорт
-    dp.callback_query.register(export_csv_callback, F.data == "export_csv")
-    dp.callback_query.register(export_json_callback, F.data == "export_json")
+    # TZ
+    dp.callback_query.register(tz_select_callback, F.data.startswith("tz:"))
+    dp.message.register(tz_manual_set, SetTimezone.waiting)
 
     # Вибір типу
     dp.callback_query.register(
@@ -1292,7 +1459,7 @@ def setup_handlers(dp: Dispatcher):
         F.data.startswith("remind_preset"),
     )
 
-    # Додавання події (FSM)
+    # Додавання події
     dp.message.register(add_event_title, AddEvent.title)
     dp.message.register(add_event_datetime, AddEvent.datetime)
     dp.message.register(add_birthday_time, AddEvent.birthday_time)
@@ -1323,7 +1490,7 @@ async def main():
 
     asyncio.create_task(reminder_loop(bot))
 
-    print("Bot started (background worker).")
+    print("Bot started (background worker, multi-TZ).")
     await dp.start_polling(bot)
 
 

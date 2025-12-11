@@ -14,16 +14,25 @@ def init_db():
     conn = get_connection()
     cur = conn.cursor()
 
+    # USERS
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             tg_id INTEGER NOT NULL UNIQUE,
-            username TEXT
+            username TEXT,
+            timezone TEXT
         );
         """
     )
 
+    # На випадок старої БД без стовпця timezone
+    cur.execute("PRAGMA table_info(users)")
+    cols = [r["name"] for r in cur.fetchall()]
+    if "timezone" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN timezone TEXT")
+
+    # EVENTS
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS events (
@@ -69,6 +78,23 @@ def get_or_create_user(tg_id: int, username: str | None) -> int:
     return cur.lastrowid
 
 
+def get_user_timezone(user_id: int) -> str | None:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT timezone FROM users WHERE id = ?", (user_id,))
+    row = cur.fetchone()
+    if not row:
+        return None
+    return row["timezone"]
+
+
+def set_user_timezone(user_id: int, tz: str) -> None:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET timezone = ? WHERE id = ?", (tz, user_id))
+    conn.commit()
+
+
 # =============== EVENTS CRUD ==================
 
 
@@ -77,10 +103,13 @@ def add_event(
     title: str,
     type_: str,
     category: str | None,
-    event_dt: datetime,
+    event_dt_utc: datetime,
     remind_before_minutes: int = 0,
     repeat_yearly: bool = False,
 ) -> int:
+    """
+    ВАЖЛИВО: event_dt_utc — це вже час у UTC (naive).
+    """
     conn = get_connection()
     cur = conn.cursor()
 
@@ -98,7 +127,7 @@ def add_event(
             title,
             type_,
             category,
-            event_dt.isoformat(),
+            event_dt_utc.isoformat(),
             remind_before_minutes,
             1 if repeat_yearly else 0,
             datetime.utcnow().isoformat(),
@@ -190,10 +219,6 @@ def delete_event(user_id: int, event_id: int) -> bool:
 
 
 def delete_event_by_id(event_id: int) -> None:
-    """
-    Видаляє подію тільки за її id.
-    Використовується для автозачистки звичайних подій після проходження.
-    """
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("DELETE FROM events WHERE id = ?", (event_id,))
@@ -211,11 +236,10 @@ def update_event_title(event_id: int, new_title: str) -> None:
 
 
 def update_event_datetime_and_reset(
-    event_id: int, new_dt: datetime, is_birthday: bool
+    event_id: int, new_dt_utc: datetime, is_birthday: bool
 ) -> None:
     """
-    Оновлює дату/час події і скидає всі прапорці notified_*.
-    Для ДР можна завжди залишати repeat_yearly = 1.
+    new_dt_utc — знову ж таки в UTC (naive).
     """
     conn = get_connection()
     cur = conn.cursor()
@@ -233,7 +257,7 @@ def update_event_datetime_and_reset(
                 notified_main = 0
             WHERE id = ?
             """,
-            (new_dt.isoformat(), event_id),
+            (new_dt_utc.isoformat(), event_id),
         )
     else:
         cur.execute(
@@ -247,7 +271,7 @@ def update_event_datetime_and_reset(
                 notified_main = 0
             WHERE id = ?
             """,
-            (new_dt.isoformat(), event_id),
+            (new_dt_utc.isoformat(), event_id),
         )
 
     conn.commit()
@@ -266,17 +290,17 @@ def update_event_remind_before(event_id: int, minutes: int) -> None:
 # =============== NOTIFICATIONS ==================
 
 
-def get_events_to_notify(now: datetime):
+def get_events_to_notify(now_utc: datetime):
     """
-    Повертає список подій, для яких настав час якогось нагадування.
-    Формат елемента: {"row": row, "kind": "30d"/"7d"/"1d"/"before"/"main"}
+    now_utc — поточний час в UTC (naive).
+    event_datetime в БД також зберігається як UTC (naive).
     """
     conn = get_connection()
     cur = conn.cursor()
 
     cur.execute(
         """
-        SELECT e.*, u.tg_id
+        SELECT e.*, u.tg_id, u.timezone
         FROM events e
         JOIN users u ON e.user_id = u.id
         """
@@ -286,35 +310,35 @@ def get_events_to_notify(now: datetime):
     result = []
 
     for row in rows:
-        event_dt = datetime.fromisoformat(row["event_datetime"])
+        event_dt_utc = datetime.fromisoformat(row["event_datetime"])
         event_type = row["type"]
         repeat_yearly = bool(row["repeat_yearly"])
 
-        # Дні народження: 30д / 7д / 1д / main
+        # Дні народження
         if event_type == "birthday":
             # 30 днів
-            target_30 = event_dt - timedelta(days=30)
+            target_30 = event_dt_utc - timedelta(days=30)
             if (
                 row["notified_30d"] == 0
-                and 0 <= (now - target_30).total_seconds() < 60
+                and 0 <= (now_utc - target_30).total_seconds() < 60
             ):
                 result.append({"row": row, "kind": "30d"})
                 continue
 
             # 7 днів
-            target_7 = event_dt - timedelta(days=7)
+            target_7 = event_dt_utc - timedelta(days=7)
             if (
                 row["notified_7d"] == 0
-                and 0 <= (now - target_7).total_seconds() < 60
+                and 0 <= (now_utc - target_7).total_seconds() < 60
             ):
                 result.append({"row": row, "kind": "7d"})
                 continue
 
             # 1 день
-            target_1 = event_dt - timedelta(days=1)
+            target_1 = event_dt_utc - timedelta(days=1)
             if (
                 row["notified_1d"] == 0
-                and 0 <= (now - target_1).total_seconds() < 60
+                and 0 <= (now_utc - target_1).total_seconds() < 60
             ):
                 result.append({"row": row, "kind": "1d"})
                 continue
@@ -322,27 +346,27 @@ def get_events_to_notify(now: datetime):
             # Основний день
             if (
                 row["notified_main"] == 0
-                and 0 <= (now - event_dt).total_seconds() < 60
+                and 0 <= (now_utc - event_dt_utc).total_seconds() < 60
             ):
                 result.append({"row": row, "kind": "main"})
                 continue
 
-        # Звичайні події: before / main
+        # Звичайні події
         else:
             before_min = row["remind_before_minutes"] or 0
 
             if before_min > 0:
-                before_dt = event_dt - timedelta(minutes=before_min)
+                before_dt_utc = event_dt_utc - timedelta(minutes=before_min)
                 if (
                     row["notified_before"] == 0
-                    and 0 <= (now - before_dt).total_seconds() < 60
+                    and 0 <= (now_utc - before_dt_utc).total_seconds() < 60
                 ):
                     result.append({"row": row, "kind": "before"})
                     continue
 
             if (
                 row["notified_main"] == 0
-                and 0 <= (now - event_dt).total_seconds() < 60
+                and 0 <= (now_utc - event_dt_utc).total_seconds() < 60
             ):
                 result.append({"row": row, "kind": "main"})
                 continue
@@ -376,7 +400,7 @@ def mark_notified(event_id: int, kind: str, repeat_yearly: bool) -> None:
         )
     elif kind == "main":
         if repeat_yearly:
-            # Для ДР: переносимо дату на наступний рік і скидаємо всі прапорці
+            # Для ДР: переносимо на наступний рік (в UTC)
             cur.execute(
                 "SELECT event_datetime FROM events WHERE id = ?",
                 (event_id,),
